@@ -212,12 +212,82 @@ def segment_keystrokes(df: pd.DataFrame, cfg, *,
 
 # -------- UI --------
 st.set_page_config(page_title="AWARE Keyboard Viewer", layout="wide")
+
+# Mobile-friendly CSS
+st.markdown("""
+<style>
+    /* Make the app more mobile-friendly */
+    @media (max-width: 768px) {
+        /* Reduce padding on mobile */
+        .block-container {
+            padding-top: 1rem;
+            padding-bottom: 1rem;
+            padding-left: 0.5rem;
+            padding-right: 0.5rem;
+        }
+        
+        /* Smaller title on mobile */
+        h1 {
+            font-size: 1.5rem !important;
+        }
+        
+        h2 {
+            font-size: 1.2rem !important;
+        }
+        
+        h3 {
+            font-size: 1rem !important;
+        }
+        
+        /* Make buttons full width on mobile */
+        .stButton > button {
+            width: 100%;
+            margin-bottom: 0.5rem;
+        }
+        
+        /* Improve text input on mobile */
+        .stTextInput > div > div > input {
+            font-size: 16px !important; /* Prevents zoom on iOS */
+        }
+        
+        /* Better spacing for columns on mobile */
+        [data-testid="column"] {
+            padding: 0.25rem !important;
+        }
+        
+        /* Make dataframes scrollable on mobile */
+        .dataframe-container {
+            overflow-x: auto;
+        }
+        
+        /* Smaller caption text */
+        .caption {
+            font-size: 0.75rem;
+        }
+    }
+    
+    /* Better button spacing overall */
+    .stButton {
+        margin-top: 0.25rem;
+    }
+    
+    /* Improve segment container appearance */
+    [data-testid="stVerticalBlock"] > div:has(> div[data-testid="stMarkdownContainer"]) {
+        padding: 0.5rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 st.title("AWARE Keyboard Segments")
 st.caption("View, segment, and clean keyboard keystroke logs from AWARE.")
 
-st.sidebar.header("Database")
-db_file_uploader = st.sidebar.file_uploader("Upload keyboard .db (SQLite)", type=["db","sqlite","sqlite3"], accept_multiple_files=False)
-db_path_text = st.sidebar.text_input("...or path to .db on disk", value="")
+# Database file upload in main area
+st.subheader("📂 Database")
+col1, col2 = st.columns([2, 1])
+with col1:
+    db_file_uploader = st.file_uploader("Upload keyboard .db (SQLite)", type=["db","sqlite","sqlite3"], accept_multiple_files=False)
+with col2:
+    db_path_text = st.text_input("...or path to .db on disk", value="")
 
 if db_file_uploader is not None:
     # Persist uploaded file to a temp path (read-only, never modified)
@@ -227,7 +297,7 @@ if db_file_uploader is not None:
     # Always overwrite to ensure we have the original file
     with open(temp_db_path, "wb") as f:
         f.write(db_file_uploader.getbuffer())
-    st.sidebar.success(f"✅ Loaded: {db_file_uploader.name}")
+    st.success(f"✅ Loaded: {db_file_uploader.name}")
     
     db_path = temp_db_path
 elif db_path_text.strip():
@@ -247,9 +317,6 @@ if not db_path or not os.path.exists(db_path):
     st.info("Upload a .db file or provide a valid path to begin.")
     st.stop()
 
-# Optional: backup button
-st.sidebar.button("Create backup copy", on_click=lambda: shutil.copyfile(db_path, db_path + ".bak"))
-
 # Connect (close any existing connection first to ensure fresh data)
 conn = sqlite3.connect(db_path)
 try:
@@ -264,13 +331,14 @@ except Exception as e:
     conn.close()
     st.stop()
 
-st.sidebar.write(f"**Detected table:** `{table}`")
+st.write(f"**Detected table:** `{table}`")
 
 cols = table_columns(conn, table)
 mapping = guess_columns(cols)
 pk_col = detect_pk_column(conn, table)
 mapping["pk"] = pk_col
 
+st.sidebar.subheader("Settings")
 st.sidebar.subheader("Column Mapping")
 for k in ["timestamp","key_code","key_character","text","package","label","action"]:
     mapping[k] = st.sidebar.selectbox(k, ["(none)"] + cols, index=(["(none)"]+cols).index(mapping[k]) if mapping[k] in cols else 0)
@@ -344,9 +412,12 @@ if q:
     q_low = q.lower()
     segments_view = [s for s in segments_not_deleted if q_low in s["text"].lower()]
 
-st.write(f"Showing **{len(segments_view)}** segments (of {len(segments)} total)")
-if st.session_state['deleted_segment_ids']:
-    st.warning(f"⚠️ {len(st.session_state['deleted_segment_ids'])} segments marked for deletion. Click 'Save Filtered DB' to create cleaned database.")
+col_info, col_warn = st.columns([1, 1])
+with col_info:
+    st.write(f"Showing **{len(segments_view)}** segments (of {len(segments)} total)")
+with col_warn:
+    if st.session_state['deleted_segment_ids']:
+        st.error(f"🗑️ {len(st.session_state['deleted_segment_ids'])} marked for deletion")
 
 # Pagination settings
 segments_per_page = st.sidebar.number_input("Segments per page", min_value=5, max_value=100, value=20, step=5)
@@ -378,10 +449,8 @@ end_idx = min(start_idx + segments_per_page, len(segments_view))
 segments_page = segments_view[start_idx:end_idx]
 
 # Batch actions
-col_a, col_b, col_c, col_d = st.columns([1,1,1,2])
+col_a, col_b, col_c = st.columns([1,1,2])
 with col_a:
-    export_btn = st.button("Export filtered segments (CSV)")
-with col_b:
     if st.button("Mark ALL for deletion", type="secondary"):
         # Mark all currently visible segments for deletion
         # We need to find the original indices of segments_view in the segments list
@@ -392,20 +461,13 @@ with col_b:
                     st.session_state['deleted_segment_ids'].add(i)
                     break
         st.rerun()
-with col_c:
+with col_b:
     save_filtered_db_btn = st.button("Save Filtered DB", type="primary")
-with col_d:
+with col_c:
     if st.session_state['deleted_segment_ids']:
         if st.button("Clear deletion marks", type="secondary", key="clear_marks_top"):
             st.session_state['deleted_segment_ids'] = set()
             st.rerun()
-
-if export_btn:
-    seg_df = pd.DataFrame([
-        {"text": s["text"], "time": s["time_str"], "start_ts": s["start_ts"], "end_ts": s["end_ts"], "package": s["package"], "label": s["label"]}
-        for s in segments_view
-    ])
-    st.download_button("Download CSV", data=seg_df.to_csv(index=False).encode("utf-8"), file_name="segments.csv", mime="text/csv")
 
 if save_filtered_db_btn:
     # Create a new database with only the rows from segments that are NOT marked for deletion
@@ -538,9 +600,13 @@ for s in segments_page:
             if s.get("label"):
                 st.caption(f"Field: {s['label']}")
         with top_cols[3]:
-            if st.button("Mark for deletion", key=f"del_{original_idx}"):
-                st.session_state['deleted_segment_ids'].add(original_idx)
-                st.rerun()
+            # Check if already marked for deletion
+            if original_idx in st.session_state['deleted_segment_ids']:
+                st.caption("✓ Marked")
+            else:
+                if st.button("🗑️ Delete", key=f"del_{original_idx}", use_container_width=True):
+                    st.session_state['deleted_segment_ids'].add(original_idx)
+                    st.toast(f"Segment {display_num} marked for deletion", icon="🗑️")
         
         # Expander to show keystrokes directly under this segment - no page refresh!
         with st.expander(f"🔍 View {len(s['row_ids'])} keystrokes"):
