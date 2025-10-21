@@ -14,6 +14,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+import time
 
 ISTANBUL_TZ = ZoneInfo("Europe/Istanbul")
 
@@ -219,16 +220,28 @@ db_file_uploader = st.sidebar.file_uploader("Upload keyboard .db (SQLite)", type
 db_path_text = st.sidebar.text_input("...or path to .db on disk", value="")
 
 if db_file_uploader is not None:
-    # Persist uploaded file to a temp path
+    # Persist uploaded file to a temp path (read-only, never modified)
     os.makedirs("data", exist_ok=True)
     temp_db_path = os.path.join("data", "uploaded_keyboard.db")
+    
+    # Always overwrite to ensure we have the original file
     with open(temp_db_path, "wb") as f:
         f.write(db_file_uploader.getbuffer())
+    st.sidebar.success(f"✅ Loaded: {db_file_uploader.name}")
+    
     db_path = temp_db_path
 elif db_path_text.strip():
     db_path = db_path_text.strip()
 else:
     db_path = None
+
+# Initialize deleted segments tracking in session state
+if 'deleted_segment_ids' not in st.session_state:
+    st.session_state['deleted_segment_ids'] = set()
+
+# Initialize expanded segments tracking (only load data for expanded ones)
+if 'expanded_segments' not in st.session_state:
+    st.session_state['expanded_segments'] = set()
 
 if not db_path or not os.path.exists(db_path):
     st.info("Upload a .db file or provide a valid path to begin.")
@@ -237,12 +250,18 @@ if not db_path or not os.path.exists(db_path):
 # Optional: backup button
 st.sidebar.button("Create backup copy", on_click=lambda: shutil.copyfile(db_path, db_path + ".bak"))
 
-# Connect
+# Connect (close any existing connection first to ensure fresh data)
 conn = sqlite3.connect(db_path)
-with conn:
-    table = detect_keyboard_table(conn)
-if not table:
-    st.error("No tables found in the database.")
+try:
+    with conn:
+        table = detect_keyboard_table(conn)
+    if not table:
+        st.error("No tables found in the database.")
+        conn.close()
+        st.stop()
+except Exception as e:
+    st.error(f"Error connecting to database: {e}")
+    conn.close()
     st.stop()
 
 st.sidebar.write(f"**Detected table:** `{table}`")
@@ -277,12 +296,23 @@ enter_keycodes = {int(x.strip()) for x in enter_keycodes.split(",") if x.strip()
 # Load rows (limit for performance, user-adjustable)
 limit = st.sidebar.number_input("Load at most N rows (0 = all)", min_value=0, max_value=2_000_000, value=0, step=1000)
 order = "ASC"
-sql = f"SELECT rowid as rowid, * FROM '{table}' ORDER BY {mapping['timestamp']} {order}"
+
+# Ensure we always have the primary key column in the result
+pk = mapping["pk"]
+if pk == "rowid":
+    sql = f"SELECT rowid as rowid, * FROM '{table}' ORDER BY {mapping['timestamp']} {order}"
+else:
+    sql = f"SELECT * FROM '{table}' ORDER BY {mapping['timestamp']} {order}"
+
 if limit and limit > 0:
     sql += f" LIMIT {int(limit)}"
 df = pd.read_sql_query(sql, conn)
 
-st.write(f"Loaded **{len(df)}** rows from `{table}`.")
+# Check total row count in the table
+total_rows_query = f"SELECT COUNT(*) FROM '{table}'"
+total_rows = conn.execute(total_rows_query).fetchone()[0]
+
+st.write(f"Loaded **{len(df)}** rows from `{table}`. Total rows in table: **{total_rows}**. Primary key: `{pk}`")
 
 # Segment
 segments = segment_keystrokes(
@@ -299,17 +329,76 @@ st.write(f"Found **{len(segments)}** message segments.")
 
 # Controls
 q = st.text_input("Filter by text contains:", "")
-segments_view = segments
+
+# First, filter out deleted segments from the original list
+segments_not_deleted = []
+segments_not_deleted_indices = []
+for i, s in enumerate(segments):
+    if i not in st.session_state['deleted_segment_ids']:
+        segments_not_deleted.append(s)
+        segments_not_deleted_indices.append(i)
+
+# Then apply text search filter
+segments_view = segments_not_deleted
 if q:
     q_low = q.lower()
-    segments_view = [s for s in segments if q_low in s["text"].lower()]
+    segments_view = [s for s in segments_not_deleted if q_low in s["text"].lower()]
+
+st.write(f"Showing **{len(segments_view)}** segments (of {len(segments)} total)")
+if st.session_state['deleted_segment_ids']:
+    st.warning(f"⚠️ {len(st.session_state['deleted_segment_ids'])} segments marked for deletion. Click 'Save Filtered DB' to create cleaned database.")
+
+# Pagination settings
+segments_per_page = st.sidebar.number_input("Segments per page", min_value=5, max_value=100, value=20, step=5)
+total_pages = max(1, (len(segments_view) + segments_per_page - 1) // segments_per_page)
+
+if 'current_page' not in st.session_state:
+    st.session_state['current_page'] = 1
+
+# Ensure current page is within bounds
+if st.session_state['current_page'] > total_pages:
+    st.session_state['current_page'] = total_pages
+
+# Pagination controls
+col_prev, col_page, col_next = st.columns([1, 2, 1])
+with col_prev:
+    if st.button("⬅️ Previous", disabled=(st.session_state['current_page'] <= 1), key="prev_page"):
+        st.session_state['current_page'] -= 1
+        st.rerun()
+with col_page:
+    st.write(f"**Page {st.session_state['current_page']} of {total_pages}**")
+with col_next:
+    if st.button("Next ➡️", disabled=(st.session_state['current_page'] >= total_pages), key="next_page"):
+        st.session_state['current_page'] += 1
+        st.rerun()
+
+# Calculate which segments to show on this page
+start_idx = (st.session_state['current_page'] - 1) * segments_per_page
+end_idx = min(start_idx + segments_per_page, len(segments_view))
+segments_page = segments_view[start_idx:end_idx]
 
 # Batch actions
-col_a, col_b, col_c = st.columns([1,1,2])
+col_a, col_b, col_c, col_d = st.columns([1,1,1,2])
 with col_a:
     export_btn = st.button("Export filtered segments (CSV)")
 with col_b:
-    delete_all_btn = st.button("Delete ALL filtered segments from DB", type="secondary")
+    if st.button("Mark ALL for deletion", type="secondary"):
+        # Mark all currently visible segments for deletion
+        # We need to find the original indices of segments_view in the segments list
+        for s in segments_view:
+            # Find this segment's index in the original segments list
+            for i, orig_s in enumerate(segments):
+                if orig_s is s:  # Same object reference
+                    st.session_state['deleted_segment_ids'].add(i)
+                    break
+        st.rerun()
+with col_c:
+    save_filtered_db_btn = st.button("Save Filtered DB", type="primary")
+with col_d:
+    if st.session_state['deleted_segment_ids']:
+        if st.button("Clear deletion marks", type="secondary", key="clear_marks_top"):
+            st.session_state['deleted_segment_ids'] = set()
+            st.rerun()
 
 if export_btn:
     seg_df = pd.DataFrame([
@@ -318,23 +407,129 @@ if export_btn:
     ])
     st.download_button("Download CSV", data=seg_df.to_csv(index=False).encode("utf-8"), file_name="segments.csv", mime="text/csv")
 
-if delete_all_btn and st.warning("This will permanently remove the underlying keystrokes for ALL filtered segments. Are you sure?").button("Yes, delete all"):
-    with conn:
-        pk = mapping["pk"]
-        for s in segments_view:
-            ids = s["row_ids"]
-            if ids:
-                placeholders = ",".join("?" for _ in ids)
-                conn.execute(f"DELETE FROM '{table}' WHERE {pk} IN ({placeholders})", ids)
-    st.success(f"Deleted {len(segments_view)} segments. Please reload.")
-    st.stop()
+if save_filtered_db_btn:
+    # Create a new database with only the rows from segments that are NOT marked for deletion
+    os.makedirs("data", exist_ok=True)
+    filtered_db_path = os.path.join("data", "keyboard-filtered.db")
+    
+    # Remove existing filtered database if it exists
+    if os.path.exists(filtered_db_path):
+        os.remove(filtered_db_path)
+    
+    # Collect all row IDs from segments that are NOT deleted (keep these)
+    keep_row_ids = set()
+    for i, s in enumerate(segments):
+        if i not in st.session_state['deleted_segment_ids']:
+            keep_row_ids.update(s["row_ids"])
+    
+    if not keep_row_ids:
+        st.warning("No segments to save (all segments marked for deletion).")
+    else:
+        with st.spinner("Creating filtered database..."):
+            # Copy the database structure and data
+            with sqlite3.connect(filtered_db_path) as new_conn:
+                # Copy schema from original database
+                with conn:
+                    # Get all table schemas (excluding internal SQLite tables)
+                    tables_to_copy = [t for t in list_tables(conn) if not t.startswith('sqlite_')]
+                    for tbl in tables_to_copy:
+                        # Get CREATE TABLE statement
+                        schema_query = f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{tbl}'"
+                        schema = conn.execute(schema_query).fetchone()
+                        if schema and schema[0]:
+                            new_conn.execute(schema[0])
+                    
+                    # Copy indices
+                    indices = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL").fetchall()
+                    for idx in indices:
+                        if idx[0]:
+                            try:
+                                new_conn.execute(idx[0])
+                            except sqlite3.OperationalError:
+                                pass  # Skip if index already exists or conflicts
+                    
+                    # For the keyboard table, only copy rows that are in keep_row_ids
+                    pk = mapping["pk"]
+                    placeholders = ",".join("?" for _ in keep_row_ids)
+                    
+                    # Get column names for INSERT
+                    columns = table_columns(conn, table)
+                    col_list = ", ".join(f'"{c}"' for c in columns)
+                    
+                    # Select only the rows we want to keep
+                    select_query = f'SELECT {col_list} FROM "{table}" WHERE {pk} IN ({placeholders})'
+                    rows_to_copy = conn.execute(select_query, list(keep_row_ids)).fetchall()
+                    
+                    # Insert into new database
+                    question_marks = ",".join("?" for _ in columns)
+                    insert_query = f'INSERT INTO "{table}" ({col_list}) VALUES ({question_marks})'
+                    new_conn.executemany(insert_query, rows_to_copy)
+                    
+                    # Copy other tables completely (if any)
+                    for tbl in tables_to_copy:
+                        if tbl != table:
+                            cols_other = table_columns(conn, tbl)
+                            col_list_other = ", ".join(f'"{c}"' for c in cols_other)
+                            rows_other = conn.execute(f'SELECT {col_list_other} FROM "{tbl}"').fetchall()
+                            if rows_other:
+                                qmarks = ",".join("?" for _ in cols_other)
+                                new_conn.executemany(f'INSERT INTO "{tbl}" ({col_list_other}) VALUES ({qmarks})', rows_other)
+                    
+                    # Update sqlite_sequence table to reflect the new row counts
+                    # This ensures autoincrement values are correct
+                    for tbl in tables_to_copy:
+                        row_count = new_conn.execute(f'SELECT COUNT(*) FROM "{tbl}"').fetchone()[0]
+                        if row_count > 0:
+                            max_id_query = f'SELECT MAX(ROWID) FROM "{tbl}"'
+                            try:
+                                max_id = new_conn.execute(max_id_query).fetchone()[0]
+                                if max_id:
+                                    # Update or insert into sqlite_sequence
+                                    new_conn.execute(
+                                        "INSERT OR REPLACE INTO sqlite_sequence (name, seq) VALUES (?, ?)",
+                                        (tbl, max_id)
+                                    )
+                            except:
+                                pass  # Table might not have autoincrement
+                    
+                    new_conn.commit()
+        
+        kept_segments = len(segments) - len(st.session_state['deleted_segment_ids'])
+        st.success(f"✅ Saved filtered database with {kept_segments} segments ({len(keep_row_ids)} rows) to: `{filtered_db_path}`")
+        
+        # Provide download button
+        with open(filtered_db_path, "rb") as f:
+            st.download_button(
+                label="📥 Download keyboard-filtered.db",
+                data=f.read(),
+                file_name="keyboard-filtered.db",
+                mime="application/x-sqlite3"
+            )
+        
+        # Option to clear deletion marks after saving
+        if st.button("Clear deletion marks", key="clear_marks_after_save"):
+            st.session_state['deleted_segment_ids'] = set()
+            st.rerun()
 
-# List UI
-for i, s in enumerate(segments_view, start=1):
+# List UI - Only show current page
+display_num = start_idx  # Start numbering from the page offset
+for s in segments_page:
+    # Find the original index in the full segments list
+    original_idx = None
+    for i, orig_s in enumerate(segments):
+        if orig_s is s:
+            original_idx = i
+            break
+    
+    if original_idx is None:
+        continue
+    
+    display_num += 1
+    
     with st.container(border=True):
         top_cols = st.columns([6,2,2,2])
         with top_cols[0]:
-            st.markdown(f"**{i}.** {s['text'][:200]}{'...' if len(s['text'])>200 else ''}")
+            st.markdown(f"**{display_num}.** {s['text'][:200]}{'...' if len(s['text'])>200 else ''}")
         with top_cols[1]:
             st.caption(f"Time: {s['time_str']}")
         with top_cols[2]:
@@ -343,15 +538,99 @@ for i, s in enumerate(segments_view, start=1):
             if s.get("label"):
                 st.caption(f"Field: {s['label']}")
         with top_cols[3]:
-            if st.button("Delete", key=f"del_{i}"):
-                # Delete rows for this segment
-                with conn:
-                    ids = s["row_ids"]
-                    if ids:
-                        pk = mapping["pk"]
-                        placeholders = ",".join("?" for _ in ids)
-                        conn.execute(f"DELETE FROM '{table}' WHERE {pk} IN ({placeholders})", ids)
-                st.success("Segment deleted. Please reload.")
-                st.stop()
+            if st.button("Mark for deletion", key=f"del_{original_idx}"):
+                st.session_state['deleted_segment_ids'].add(original_idx)
+                st.rerun()
+        
+        # Expander to show keystrokes directly under this segment - no page refresh!
+        with st.expander(f"🔍 View {len(s['row_ids'])} keystrokes"):
+            try:
+                pk = mapping["pk"]
+                row_ids = s["row_ids"]
+                
+                if row_ids:
+                    with st.spinner("Loading keystrokes..."):
+                        # Fetch all rows for this segment
+                        placeholders = ",".join("?" for _ in row_ids)
+                        query = f'SELECT * FROM "{table}" WHERE {pk} IN ({placeholders}) ORDER BY {mapping["timestamp"]}'
+                        segment_rows_cursor = conn.execute(query, row_ids)
+                        
+                        # Get column names
+                        col_names = [description[0] for description in segment_rows_cursor.description]
+                        
+                        # Fetch rows
+                        segment_rows = segment_rows_cursor.fetchall()
+                        
+                        # Create DataFrame for display
+                        rows_df = pd.DataFrame(segment_rows, columns=col_names)
+                    
+                    # Show summary stats
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Total Rows", len(rows_df))
+                    with col2:
+                        if mapping["timestamp"] and mapping["timestamp"] in rows_df.columns:
+                            try:
+                                duration_ms = float(rows_df[mapping["timestamp"]].max() - rows_df[mapping["timestamp"]].min())
+                                st.metric("Duration", f"{duration_ms/1000:.1f}s")
+                            except:
+                                st.metric("Duration", "N/A")
+                    with col3:
+                        st.metric("Row IDs", f"{min(row_ids)}-{max(row_ids)}")
+                    
+                    # Select important columns to display
+                    display_cols = []
+                    if mapping["timestamp"] and mapping["timestamp"] in rows_df.columns:
+                        rows_df.insert(0, 'Time', rows_df[mapping["timestamp"]].apply(
+                            lambda x: ms_to_local_str(int(x)) if pd.notna(x) else ""
+                        ))
+                        display_cols.append('Time')
+                    
+                    # Add other important columns
+                    for col in ['key_character', 'key_code', 'text', 'package_name', 'label']:
+                        mapped_col = mapping.get(col.replace('_', ''))
+                        if mapped_col and mapped_col in rows_df.columns:
+                            display_cols.append(mapped_col)
+                    
+                    # If no important columns found, show all
+                    if not display_cols:
+                        display_cols = list(rows_df.columns)
+                    
+                    # Display limited columns for better performance
+                    st.dataframe(
+                        rows_df[display_cols] if display_cols else rows_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        height=300
+                    )
+                    
+                    # Option to show all columns
+                    if st.checkbox("Show all columns", key=f"allcols_{original_idx}"):
+                        st.dataframe(
+                            rows_df,
+                            use_container_width=True,
+                            hide_index=True,
+                            height=400
+                        )
+                else:
+                    st.info("No keystroke data available for this segment.")
+            except Exception as e:
+                st.error(f"Error loading keystrokes: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+
+# Bottom pagination controls
+st.markdown("---")
+col_prev2, col_page2, col_next2 = st.columns([1, 2, 1])
+with col_prev2:
+    if st.button("⬅️ Previous", disabled=(st.session_state['current_page'] <= 1), key="prev_page2"):
+        st.session_state['current_page'] -= 1
+        st.rerun()
+with col_page2:
+    st.write(f"**Page {st.session_state['current_page']} of {total_pages}**")
+with col_next2:
+    if st.button("Next ➡️", disabled=(st.session_state['current_page'] >= total_pages), key="next_page2"):
+        st.session_state['current_page'] += 1
+        st.rerun()
 
 st.info("Tip: Use the filter box to find sensitive messages and delete them in bulk.")
