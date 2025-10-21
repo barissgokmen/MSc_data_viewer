@@ -264,6 +264,19 @@ st.markdown("""
         .caption {
             font-size: 0.75rem;
         }
+        
+        /* Fix pagination buttons layout on mobile */
+        [data-testid="column"] > div {
+            min-width: 0;
+        }
+        
+        /* Ensure buttons don't overflow */
+        .stButton button {
+            white-space: nowrap;
+            padding-left: 0.5rem;
+            padding-right: 0.5rem;
+            font-size: 0.9rem;
+        }
     }
     
     /* Better button spacing overall */
@@ -283,11 +296,7 @@ st.caption("View, segment, and clean keyboard keystroke logs from AWARE.")
 
 # Database file upload in main area
 st.subheader("📂 Database")
-col1, col2 = st.columns([2, 1])
-with col1:
-    db_file_uploader = st.file_uploader("Upload keyboard .db (SQLite)", type=["db","sqlite","sqlite3"], accept_multiple_files=False)
-with col2:
-    db_path_text = st.text_input("...or path to .db on disk", value="")
+db_file_uploader = st.file_uploader("Upload keyboard .db (SQLite)", type=["db","sqlite","sqlite3"], accept_multiple_files=False)
 
 if db_file_uploader is not None:
     # Persist uploaded file to a temp path (read-only, never modified)
@@ -300,8 +309,6 @@ if db_file_uploader is not None:
     st.success(f"✅ Loaded: {db_file_uploader.name}")
     
     db_path = temp_db_path
-elif db_path_text.strip():
-    db_path = db_path_text.strip()
 else:
     db_path = None
 
@@ -398,19 +405,11 @@ st.write(f"Found **{len(segments)}** message segments.")
 # Controls
 q = st.text_input("Filter by text contains:", "")
 
-# First, filter out deleted segments from the original list
-segments_not_deleted = []
-segments_not_deleted_indices = []
-for i, s in enumerate(segments):
-    if i not in st.session_state['deleted_segment_ids']:
-        segments_not_deleted.append(s)
-        segments_not_deleted_indices.append(i)
-
-# Then apply text search filter
-segments_view = segments_not_deleted
+# Apply text search filter (keep all segments, including marked ones)
+segments_view = segments
 if q:
     q_low = q.lower()
-    segments_view = [s for s in segments_not_deleted if q_low in s["text"].lower()]
+    segments_view = [s for s in segments if q_low in s["text"].lower()]
 
 col_info, col_warn = st.columns([1, 1])
 with col_info:
@@ -431,15 +430,15 @@ if st.session_state['current_page'] > total_pages:
     st.session_state['current_page'] = total_pages
 
 # Pagination controls
-col_prev, col_page, col_next = st.columns([1, 2, 1])
+col_prev, col_page, col_next = st.columns([2, 3, 2])
 with col_prev:
-    if st.button("⬅️ Previous", disabled=(st.session_state['current_page'] <= 1), key="prev_page"):
+    if st.button("⬅️ Prev", disabled=(st.session_state['current_page'] <= 1), key="prev_page", use_container_width=True):
         st.session_state['current_page'] -= 1
         st.rerun()
 with col_page:
-    st.write(f"**Page {st.session_state['current_page']} of {total_pages}**")
+    st.markdown(f"<div style='text-align: center; padding-top: 0.3rem;'><b>Page {st.session_state['current_page']} of {total_pages}</b></div>", unsafe_allow_html=True)
 with col_next:
-    if st.button("Next ➡️", disabled=(st.session_state['current_page'] >= total_pages), key="next_page"):
+    if st.button("Next ➡️", disabled=(st.session_state['current_page'] >= total_pages), key="next_page", use_container_width=True):
         st.session_state['current_page'] += 1
         st.rerun()
 
@@ -588,10 +587,20 @@ for s in segments_page:
     
     display_num += 1
     
-    with st.container(border=True):
+    # Check if marked for deletion
+    is_marked = original_idx in st.session_state['deleted_segment_ids']
+    
+    # Apply red background styling if marked
+    if is_marked:
+        st.markdown("""
+        <div style='background-color: rgba(255, 70, 70, 0.15); padding: 1rem; border-radius: 0.5rem; border: 2px solid rgba(255, 70, 70, 0.4); margin-bottom: 0.5rem;'>
+        """, unsafe_allow_html=True)
+    
+    with st.container(border=not is_marked):
         top_cols = st.columns([6,2,2,2])
         with top_cols[0]:
-            st.markdown(f"**{display_num}.** {s['text'][:200]}{'...' if len(s['text'])>200 else ''}")
+            text_style = "color: #ff4646;" if is_marked else ""
+            st.markdown(f"<span style='{text_style}'><b>{display_num}.</b> {s['text'][:200]}{'...' if len(s['text'])>200 else ''}</span>", unsafe_allow_html=True)
         with top_cols[1]:
             st.caption(f"Time: {s['time_str']}")
         with top_cols[2]:
@@ -601,8 +610,10 @@ for s in segments_page:
                 st.caption(f"Field: {s['label']}")
         with top_cols[3]:
             # Check if already marked for deletion
-            if original_idx in st.session_state['deleted_segment_ids']:
-                st.caption("✓ Marked")
+            if is_marked:
+                if st.button("↩️ Unmark", key=f"del_{original_idx}", use_container_width=True):
+                    st.session_state['deleted_segment_ids'].remove(original_idx)
+                    st.toast(f"Segment {display_num} unmarked", icon="↩️")
             else:
                 if st.button("🗑️ Delete", key=f"del_{original_idx}", use_container_width=True):
                     st.session_state['deleted_segment_ids'].add(original_idx)
@@ -684,18 +695,22 @@ for s in segments_page:
                 st.error(f"Error loading keystrokes: {e}")
                 import traceback
                 st.code(traceback.format_exc())
+    
+    # Close the red background div if marked
+    if is_marked:
+        st.markdown("</div>", unsafe_allow_html=True)
 
 # Bottom pagination controls
 st.markdown("---")
-col_prev2, col_page2, col_next2 = st.columns([1, 2, 1])
+col_prev2, col_page2, col_next2 = st.columns([2, 3, 2])
 with col_prev2:
-    if st.button("⬅️ Previous", disabled=(st.session_state['current_page'] <= 1), key="prev_page2"):
+    if st.button("⬅️ Prev", disabled=(st.session_state['current_page'] <= 1), key="prev_page2", use_container_width=True):
         st.session_state['current_page'] -= 1
         st.rerun()
 with col_page2:
-    st.write(f"**Page {st.session_state['current_page']} of {total_pages}**")
+    st.markdown(f"<div style='text-align: center; padding-top: 0.3rem;'><b>Page {st.session_state['current_page']} of {total_pages}</b></div>", unsafe_allow_html=True)
 with col_next2:
-    if st.button("Next ➡️", disabled=(st.session_state['current_page'] >= total_pages), key="next_page2"):
+    if st.button("Next ➡️", disabled=(st.session_state['current_page'] >= total_pages), key="next_page2", use_container_width=True):
         st.session_state['current_page'] += 1
         st.rerun()
 
